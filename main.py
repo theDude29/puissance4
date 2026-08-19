@@ -4,7 +4,9 @@ This is the "boss": it wires together the two modules and starts a game.
     - minmax.py : the game engine + AI (moved out of this file)
     - cli.py    : the interactive terminal front-end
 
-The AI's search depth can be passed as the first command-line argument.
+The AI's thinking time, in seconds per move, can be passed as the first
+command-line argument. It deepens its search until that budget runs out, so
+the depth it reaches depends on the position rather than being fixed.
 """
 
 import sys
@@ -14,14 +16,17 @@ import cli      # the interactive front-end
 
 
 def main():
-    depth = 9  # a sensible default look-ahead: about half a second per move
+    seconds = 2.0  # long enough to reach ~10 plies from the opening
     if len(sys.argv) > 1:
         try:
-            depth = int(sys.argv[1])
+            seconds = float(sys.argv[1])
+            if seconds <= 0:
+                raise ValueError
         except ValueError:
-            print(f"Ignoring invalid depth '{sys.argv[1]}', using {depth}.")
+            seconds = 2.0
+            print(f"Ignoring invalid time budget '{sys.argv[1]}', using {seconds}s.")
 
-    cli.play(depth=depth)
+    cli.play(time_limit=seconds)
 
 
 if __name__ == "__main__":

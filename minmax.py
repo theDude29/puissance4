@@ -21,6 +21,8 @@ Read them in that order; each section explains why it exists. The README
 covers the same ground with measurements.
 """
 
+from time import perf_counter
+
 K = 4
 HEIGHT = 6
 WIDTH = 7
@@ -48,6 +50,24 @@ EXACT, LOWER, UPPER = 0, 1, 2
 # Move-ordering key: central columns take part in more lines, so they are more
 # often best, and trying them first makes alpha-beta cut sooner.
 CENTRE = {c: abs(c - WIDTH // 2) for c in range(WIDTH)}
+
+# How much of the tree must be left below a node for it to be worth reading the
+# clock. Most nodes sit at the very bottom, so checking everywhere would spend
+# more time on `perf_counter` than on searching; a subtree with two plies left
+# finishes in microseconds, which is fine as abort granularity.
+CHECK_DEPTH = 2
+
+
+class TimeUp(Exception):
+    """Raised inside `minmax` when the move's time budget is spent.
+
+    Unwinding by exception rather than by returning a sentinel is what keeps
+    the transposition table sound: entries are written after a node's move loop
+    finishes, so an abort skips every store on the way out and no half-searched
+    value is ever recorded. Subtrees that did complete before the abort stay in
+    the table and remain valid.
+    """
+
 
 LINES = []
 
@@ -210,7 +230,7 @@ def get_next_move(board, player):
     return moves
 
 
-def minmax(player, board, depth, a, b, tt):
+def minmax(player, board, depth, a, b, tt, deadline=None):
     """Return (best_column, best_score) for `player` to move.
 
     best_score is `player`'s heuristic value (higher is better; `±(WIN + depth)`
@@ -228,6 +248,9 @@ def minmax(player, board, depth, a, b, tt):
     `tt` is the transposition table for this search — see `search`, which owns
     it. Callers outside the recursion should go through `search` rather than
     calling this directly.
+
+    `deadline` is an absolute `perf_counter` reading past which the search
+    gives up by raising `TimeUp`. None means no limit.
     """
     # evaluate the leaf from the mover's own perspective, passing the depth
     # left so that a win reached sooner outranks the same win reached later.
@@ -235,6 +258,12 @@ def minmax(player, board, depth, a, b, tt):
     # miss, and building the key costs more than the test.
     if depth == 0 or is_final(board):
         return None, score(board, player, depth)
+
+    # Out of time: abandon the whole pass. `search` keeps the previous, fully
+    # completed pass instead — see there for why a half-finished one is not
+    # merely less accurate but actively unsafe to use.
+    if deadline is not None and depth >= CHECK_DEPTH and perf_counter() > deadline:
+        raise TimeUp
 
     # `player` belongs in the key: the same board is worth different things
     # depending on who has to move.
@@ -278,7 +307,7 @@ def minmax(player, board, depth, a, b, tt):
     # its value to us is exactly its negation. The window is negated and
     # swapped for the same reason — our floor is the opponent's ceiling.
     for col, child in next_moves:
-        _, child_score = minmax(-player, child, depth - 1, -b, -a, tt)
+        _, child_score = minmax(-player, child, depth - 1, -b, -a, tt, deadline)
         val = -child_score
         if val > best_score:
             best_score = val
@@ -310,13 +339,27 @@ def minmax(player, board, depth, a, b, tt):
     return best_move, best_score
 
 
-def search(player, board, max_depth):
-    """Return (best_column, best_score) for `player`, by iterative deepening.
+def search(player, board, max_depth=HEIGHT * WIDTH, time_limit=None):
+    """Return (best_column, best_score, depth) for `player`, by iterative
+    deepening under a time budget.
 
-    Searches depth 1, then 2, ... up to `max_depth`, all sharing one
-    transposition table. The re-search is far cheaper than it looks: each pass
-    leaves its best move behind in the table, and the next pass tries that move
-    first, which is what makes alpha-beta cut early.
+    Searches depth 1, then 2, ... all passes sharing one transposition table,
+    and stops at `max_depth` or when `time_limit` seconds are up, whichever
+    comes first. `time_limit=None` means no clock at all, which makes this a
+    plain fixed-depth search — how the tests pin the values down. The returned
+    `depth` is the depth actually reached, which varies with the position: a
+    near-empty board is cheap to search deeply, a crowded one is not.
+
+    The re-search is far cheaper than it looks: the tree grows geometrically,
+    so every pass before the last costs a fraction of the total, and each one
+    leaves its best move in the table for the next to try first — which is what
+    makes alpha-beta cut early. Deepening is also exactly what makes a time
+    budget usable: there is always a complete, shallower answer in hand.
+
+    Only complete passes are ever returned. An interrupted pass has looked at
+    some root moves and not others, so its best-so-far is not the best move —
+    it is merely the best of an arbitrary prefix, and can be worse than what
+    the previous pass already knew. `TimeUp` therefore discards the pass whole.
 
     The table is created here and dropped on return, which keeps a useful
     invariant. `score` returns `±(WIN + depth)`, so a mate score depends on the
@@ -329,9 +372,28 @@ def search(player, board, max_depth):
     negamax.
     """
     tt = {}
-    result = (None, None)
+    deadline = None if time_limit is None else perf_counter() + time_limit
+    best_move, best_score, reached = None, None, 0
 
     for depth in range(1, max(1, max_depth) + 1):
-        result = minmax(player, board, depth, -float('inf'), float('inf'), tt)
+        try:
+            # Depth 1 runs without a deadline so that there is always a legal
+            # move to return, however small the budget. It costs one ply.
+            move, value = minmax(player, board, depth, -float('inf'),
+                                 float('inf'), tt,
+                                 deadline if depth > 1 else None)
+        except TimeUp:
+            break
 
-    return result
+        best_move, best_score, reached = move, value, depth
+
+        # A decided position cannot be improved on by looking further. Because
+        # deepening goes shallow first, the earliest pass to see a mate sees
+        # the shortest one, so the remaining budget would only confirm it.
+        # Measured over 250 forced wins, stopping here never lengthens the mate;
+        # it can pick a different move among equally fast wins, which is the
+        # same tie-break arbitrariness the move ordering already has.
+        if abs(value) >= WIN:
+            break
+
+    return best_move, best_score, reached

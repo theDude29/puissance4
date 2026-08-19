@@ -2,12 +2,17 @@
 
 A Connect-4 (Puissance 4) engine and terminal front-end in plain Python, no
 dependencies. The interesting part is the search: a negamax with alpha-beta
-pruning, a transposition table and iterative deepening, documented below.
+pruning, a transposition table and time-controlled iterative deepening,
+documented below.
 
 ```bash
-python3 main.py        # AI searches 9 plies ahead, ~0.4 s per move
-python3 main.py 11     # deeper, slower
+python3 main.py        # AI thinks 2 s per move
+python3 main.py 0.5    # faster, weaker
 ```
+
+The argument is the AI's thinking time in seconds, not a depth: it deepens
+until the budget runs out and reports how far it got, so it searches further in
+simple positions than in crowded ones.
 
 You play `X` and move first; the AI answers as `O`. Columns are 1-indexed at
 the prompt, `q` quits.
@@ -245,8 +250,8 @@ board would break it, and the mate scores would then need renormalising.
 
 ## Iterative deepening
 
-`search` is the public entry point. It searches depth 1, then 2, and so on up
-to the requested depth, all passes sharing one table.
+`search` is the public entry point. It searches depth 1, then 2, and so on, all
+passes sharing one table.
 
 Re-searching from scratch each time sounds wasteful and is not: the tree grows
 geometrically, so every pass before the last costs a fraction of the total, and
@@ -257,6 +262,58 @@ guess is a shallower search of the same position.
 Moves are otherwise ordered centre-outwards, since central columns take part in
 more lines. That ordering alone is worth more than the table: it is what turns
 a 2.2× speedup into 5.6×.
+
+## Time control
+
+Deepening is also what makes a clock usable: the search always has a complete,
+shallower answer in hand, so it can be stopped at any moment and still have
+something to play. `search(player, board, time_limit=2.0)` deepens until the
+budget is spent and returns the depth it reached alongside the move.
+
+From the opening, on this machine:
+
+| budget | depth reached |
+| ---: | ---: |
+| 0.1 s | 6 |
+| 0.5 s | 8 |
+| 2 s | 10 |
+
+Overshoot is small — 2.7 ms on a 1 s budget at worst — because the clock is
+read inside the search rather than only between passes.
+
+### Only complete passes count
+
+The rule that matters: an interrupted pass is thrown away whole. It has
+examined some root moves and not others, so its best-so-far is not a best move
+at all, only the best of an arbitrary prefix, and it can be worse than what the
+previous pass already established. `search` keeps the last pass that finished.
+
+### Aborting without corrupting the table
+
+Running out of time raises `TimeUp` from inside the recursion rather than
+returning a sentinel, and that choice is what keeps the transposition table
+sound. Entries are written *after* a node's move loop completes, so unwinding
+by exception skips every pending store on the way out — no half-searched value
+is ever recorded. Subtrees that did finish before the abort keep their entries,
+which are valid, and the next pass reuses them.
+
+Checked directly: after aborting mid-pass on a tight budget, every surviving
+entry still agrees with a clean search at its own depth — exact values exact,
+`LOWER` and `UPPER` bounding the true value on the right side. 0 bad entries
+out of 1,600.
+
+Reading the clock costs nothing measurable on the fixed-depth path, since the
+check is guarded on there being a budget at all, and even with one it only
+fires at nodes with at least two plies left below them — most nodes are at the
+very bottom, and a two-ply subtree finishes in microseconds.
+
+### Stopping on a decided position
+
+A forced win needs no further search. Because deepening goes shallow first, the
+first pass to see a mate sees the shortest one, so `search` returns as soon as
+a mate score appears rather than spending the rest of the budget confirming it.
+Measured over 250 forced wins, this never lengthens the mate; it can pick a
+different move among equally fast wins.
 
 ## What it buys
 
@@ -271,8 +328,8 @@ Nodes visited on 10 random midgame positions, at each stage of the search:
 
 In wall-clock terms the last column is 5.2× faster than alpha-beta alone at
 depth 6 and 9.4× at depth 7. The gain compounds with depth, which is the whole
-point: none of this changes the answer, it buys plies. At the default depth of
-9 the AI moves in about 0.4 s.
+point: none of this changes the answer, it buys plies — which the time control
+then spends, reaching depth 10 from the opening on a 2 s budget.
 
 Every variant returns identical values on all 10 positions at every depth
 tested, and matches a plain unpruned negamax. That equivalence is the
@@ -285,9 +342,9 @@ table, see above.
   redone from one turn to the next. Keeping it would need the mate-score
   renormalisation described above, since entries would then be probed at a
   different remaining depth than they were stored at.
-- **No time control.** Iterative deepening makes the search interruptible — it
-  always has a complete shallower answer in hand — but nothing uses that yet;
-  the depth is fixed up front.
+- **The budget is per move, flat.** Every move gets the same seconds,
+  regardless of whether the position is critical or already decided. Spending
+  more on sharp positions and less on quiet ones is the usual next step.
 - **`WIN` outranks the heuristic by a margin, not by construction.** See above:
   a side holding `BASE` open 3-in-a-rows would close the gap. Deriving `WIN`
   from `len(LINES) * BASE ** (K - 2)` would make it airtight.

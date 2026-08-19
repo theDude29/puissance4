@@ -78,8 +78,12 @@ def announce(board):
     return False
 
 
-def play(depth=9):
-    """Run one interactive game. The human (X) moves first."""
+def play(time_limit=2.0):
+    """Run one interactive game. The human (X) moves first.
+
+    `time_limit` is the AI's budget in seconds per move; it deepens its search
+    until that runs out, so the depth it reaches varies with the position.
+    """
     board = [0] * (HEIGHT * WIDTH)
 
     print("Puissance 4 — you are X, the AI is O. You go first.")
@@ -93,7 +97,7 @@ def play(depth=9):
 
         # --- AI turn ---
         print("AI is thinking...")
-        col, _ = search(AI, board, depth)
+        col, _, depth = search(AI, board, time_limit=time_limit)
 
         # The search returns a column, not a board — it explored copies and
         # kept none of them. Replaying the move here re-derives the resulting
@@ -102,7 +106,9 @@ def play(depth=9):
             if c == col:
                 board = child
                 break
-        print(f"AI plays column {col + 1}.")
+        # report the depth reached: it is the visible sign of the time budget
+        # at work, and it climbs as the board fills and branches thin out
+        print(f"AI plays column {col + 1}. (searched {depth} plies)")
         render(board)
         if announce(board):
             return
