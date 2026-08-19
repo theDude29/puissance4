@@ -6,6 +6,19 @@ Board model: a single flat list of HEIGHT*WIDTH ints.
     - value -1 -> player -1 (the AI, "O")
 Cell (row, col) lives at index `row*WIDTH + col`, with row 0 at the top and
 row HEIGHT-1 at the bottom (where tokens pile up).
+
+The AI is built in layers, each one useless without the one below it:
+
+    score()   static evaluation — how good a position *looks*, judged on the
+              spot, without playing anything out. Fast and shallow.
+    minmax()  negamax + alpha-beta + move ordering + transposition table —
+              how good a position *plays out*, by looking ahead and assuming
+              the opponent plays as well as we do.
+    search()  iterative deepening — the entry point the front-end calls. Runs
+              minmax at depth 1, 2, 3 ... and feeds each pass to the next.
+
+Read them in that order; each section explains why it exists. The README
+covers the same ground with measurements.
 """
 
 K = 4
@@ -26,10 +39,28 @@ WIDTH = 7
 BASE = 20
 WIN = BASE ** (K - 1)
 
+# Transposition-table bound kinds. Under alpha-beta a stored value is not
+# always the node's exact value: a cutoff only proves a lower bound, and a node
+# where nothing raised alpha only proves an upper one. Storing the number
+# without saying which it is would be wrong.
+EXACT, LOWER, UPPER = 0, 1, 2
+
+# Move-ordering key: central columns take part in more lines, so they are more
+# often best, and trying them first makes alpha-beta cut sooner.
+CENTRE = {c: abs(c - WIDTH // 2) for c in range(WIDTH)}
+
 LINES = []
 
-# Precompute every K-in-a-row line as a list of flat board indices, generated
-# only when the line fully fits on its axis (no wrap-around across rows).
+# Precompute every K-in-a-row line as a list of flat board indices. The
+# evaluation below walks all of them at every node of the search — millions of
+# times per move — so the geometry is worked out once, here, and never again:
+# checking a position afterwards is just reading cells.
+#
+# The four guards are what keep the flat layout honest. Indices 6 and 7 are
+# neighbours in the list but sit on different rows (end of row 0, start of
+# row 1), so a horizontal run started near the right edge would silently wrap
+# around and "win" across two rows. Each direction is emitted only from squares
+# where it fully fits on the board.
 for i in range(HEIGHT):
     for j in range(WIDTH):
         base = i * WIDTH + j
@@ -65,6 +96,10 @@ def score(board, player, depth=0):
     so a win found early (much depth left) scores above the same win found
     later. Left at its default of 0 the function is a pure static evaluation.
     """
+    # The idea: a position is good for you if you have many ways left to make
+    # four in a row, and few for the opponent. So count, for each side, the
+    # lines it could still complete, bucketed by how far along it already is —
+    # counts[0] is lines holding one of its tokens, counts[1] two, and so on.
     counts_player = [0] * K
     counts_opponent = [0] * K
 
@@ -79,7 +114,11 @@ def score(board, player, depth=0):
             elif board[n] == -player:
                 curr_oppo += 1
 
-        # only "open" lines (owned by a single side) contribute
+        # A line holding tokens from both sides is dead: neither player can
+        # ever fill it, so it is worth nothing to anyone and simply drops out.
+        # Only lines owned by a single side — "open" lines — are counted, which
+        # is also why the two conditions below are exclusive rather than an
+        # if/else over one count.
         if curr_player != 0 and curr_oppo == 0:
             counts_player[curr_player - 1] += 1
         if curr_player == 0 and curr_oppo != 0:
@@ -95,6 +134,12 @@ def score(board, player, depth=0):
     if counts_opponent[K - 1] > 0:
         return -(WIN + depth)
 
+    # Weigh the buckets against each other. One line already holding three
+    # tokens is worth far more than three separate lines holding one each — it
+    # is one move from winning — so bucket values grow geometrically in BASE
+    # rather than linearly. Subtracting the opponent's buckets from ours is
+    # what makes the whole function antisymmetric, which the negamax search
+    # below relies on.
     score = 0
     mult = 1
     for i in range(K - 1):
@@ -120,7 +165,9 @@ def is_final(board):
     if winning_player(board) != 0:
         return True
 
-    # the top cell of column c is index c (row 0); an empty one means not full
+    # No winner, so the only other way to end is a full board — a draw. A
+    # column is full exactly when its top cell is taken, and the top cell of
+    # column c is index c (row 0), so one pass over the first row settles it.
     for c in range(WIDTH):
         if board[c] == 0:
             return False
@@ -133,6 +180,12 @@ def get_next_move(board, player):
 
     A token dropped in a column falls to the lowest empty cell. Full columns
     are skipped entirely.
+
+    Each move comes with the entire board it leads to, rather than being
+    applied to a shared board and undone afterwards. That costs one copy per
+    move, but it keeps the search free of any make/unmake bookkeeping: a node
+    never has to restore anything, because it never modified anything. For a
+    board this small it is the better trade.
     """
     moves = []
 
@@ -157,30 +210,75 @@ def get_next_move(board, player):
     return moves
 
 
-def minmax(player, board, depth, a, b):
+def minmax(player, board, depth, a, b, tt):
     """Return (best_column, best_score) for `player` to move.
 
     best_score is `player`'s heuristic value (higher is better; `±(WIN + depth)`
     for a decided position). best_column is None only when there are no moves
     (terminal / full board).
+
+    `a` and `b` are the alpha-beta window: the range of values still worth
+    knowing precisely. `a` is the best the side to move has already secured
+    somewhere else on the path, `b` the ceiling above which the parent will
+    stop caring, because it already holds something at least that good. As
+    soon as those two meet, whatever is left in this node cannot change any
+    decision above it, and the loop stops — that is the whole of the pruning.
+    A first call therefore passes the widest possible window.
+
+    `tt` is the transposition table for this search — see `search`, which owns
+    it. Callers outside the recursion should go through `search` rather than
+    calling this directly.
     """
     # evaluate the leaf from the mover's own perspective, passing the depth
-    # left so that a win reached sooner outranks the same win reached later
+    # left so that a win reached sooner outranks the same win reached later.
+    # Done before probing: leaves are never stored, so a probe would only ever
+    # miss, and building the key costs more than the test.
     if depth == 0 or is_final(board):
         return None, score(board, player, depth)
 
+    # `player` belongs in the key: the same board is worth different things
+    # depending on who has to move.
+    key = (tuple(board), player)
+    a0 = a
+    tt_move = None
+
+    entry = tt.get(key)
+    if entry is not None:
+        entry_depth, entry_value, entry_flag, tt_move = entry
+
+        # the stored move is a useful ordering hint whatever depth produced it,
+        # but the value may only be trusted if it came from a search at least
+        # as deep as the one being asked for
+        if entry_depth >= depth:
+            if entry_flag == EXACT:
+                return tt_move, entry_value
+            if entry_flag == LOWER:
+                a = max(a, entry_value)
+            else:
+                b = min(b, entry_value)
+            if a >= b:
+                return tt_move, entry_value
+
     next_moves = get_next_move(board, player)
 
-    # seed with the first legal column: every branch can evaluate to -inf (a
+    # best move first, then centre outwards. `tt_move` is None on a miss, which
+    # makes the first key constant and leaves the centre ordering intact.
+    next_moves.sort(key=lambda m: (m[0] != tt_move, CENTRE[m[0]]))
+
+    # seed with the first column tried: every branch can evaluate to -inf (a
     # lost position), and `val > best_score` would then never fire and leave
-    # best_move as None. Keep `>` so ties go to the first column found.
+    # best_move as None. Keep `>` so ties go to the first column tried.
     best_move = next_moves[0][0]
     best_score = -float('inf')
 
-    # negamax: each child is evaluated from the opponent's perspective, and
-    # because `score` is antisymmetric the value to `player` is its negation.
+    # Negamax, rather than the textbook pair of maximising and minimising
+    # branches: every node is read from the point of view of whoever is to
+    # move, so both players "maximise" and one code path serves both. The
+    # child is searched for the opponent, and because `score` is antisymmetric
+    # its value to us is exactly its negation. The window is negated and
+    # swapped for the same reason — our floor is the opponent's ceiling.
     for col, child in next_moves:
-        _, child_score = minmax(-player, child, depth - 1, -b, -a)
+        _, child_score = minmax(-player, child, depth - 1, -b, -a, tt)
         val = -child_score
         if val > best_score:
             best_score = val
@@ -188,7 +286,52 @@ def minmax(player, board, depth, a, b):
 
         a = max(a, val)
 
+        # Cutoff: this node is already worth at least `b` to us, so the parent
+        # — which can hold us to `b` by choosing something else — will never
+        # pick the move that leads here. The siblings left cannot change that,
+        # so they are never generated. Note `>=` and not `>`: a value merely
+        # equal to `b` is already enough for the parent to prefer what it has.
         if a >= b:
             break
 
+    # classify what the search actually proved: a value that never beat the
+    # incoming alpha is only an upper bound, one that reached beta is only a
+    # lower bound, and anything in between is exact
+    if best_score <= a0:
+        flag = UPPER
+    elif best_score >= b:
+        flag = LOWER
+    else:
+        flag = EXACT
+
+    if entry is None or entry[0] <= depth:
+        tt[key] = (depth, best_score, flag, best_move)
+
     return best_move, best_score
+
+
+def search(player, board, max_depth):
+    """Return (best_column, best_score) for `player`, by iterative deepening.
+
+    Searches depth 1, then 2, ... up to `max_depth`, all sharing one
+    transposition table. The re-search is far cheaper than it looks: each pass
+    leaves its best move behind in the table, and the next pass tries that move
+    first, which is what makes alpha-beta cut early.
+
+    The table is created here and dropped on return, which keeps a useful
+    invariant. `score` returns `±(WIN + depth)`, so a mate score depends on the
+    depth that found it — normally a reason to renormalise before storing. It
+    is not needed here: in Connect-4 the number of tokens fixes the ply, so a
+    position always occurs at the same ply and therefore at the same remaining
+    depth within a pass, while entries left by shallower passes are refused by
+    the `entry_depth >= depth` guard. Every value ever reused was produced at
+    exactly the depth it is reused at, so the result matches a plain fixed-depth
+    negamax.
+    """
+    tt = {}
+    result = (None, None)
+
+    for depth in range(1, max(1, max_depth) + 1):
+        result = minmax(player, board, depth, -float('inf'), float('inf'), tt)
+
+    return result

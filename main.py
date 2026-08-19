@@ -14,7 +14,7 @@ import cli      # the interactive front-end
 
 
 def main():
-    depth = 5  # a sensible default look-ahead
+    depth = 9  # a sensible default look-ahead: about half a second per move
     if len(sys.argv) > 1:
         try:
             depth = int(sys.argv[1])

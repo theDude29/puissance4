@@ -5,7 +5,7 @@ logic lives in `minmax.py` — this module only handles rendering the board and
 reading/validating the human's input.
 """
 
-from minmax import WIDTH, HEIGHT, winning_player, is_final, get_next_move, minmax
+from minmax import WIDTH, HEIGHT, winning_player, is_final, get_next_move, search
 
 HUMAN = 1
 AI = -1
@@ -32,6 +32,10 @@ def winner(board):
 def ask_human_move(board):
     """Prompt until the human enters a legal, non-full column; return the
     resulting board."""
+    # The engine already knows every legal move and the board each one leads
+    # to, so validating input is a dict lookup rather than a second set of
+    # rules living here. Keeping the rules in one place is what stops the
+    # front-end and the search from ever disagreeing about what is legal.
     legal = {col: child for col, child in get_next_move(board, HUMAN)}
 
     while True:
@@ -74,7 +78,7 @@ def announce(board):
     return False
 
 
-def play(depth=4):
+def play(depth=9):
     """Run one interactive game. The human (X) moves first."""
     board = [0] * (HEIGHT * WIDTH)
 
@@ -89,8 +93,11 @@ def play(depth=4):
 
         # --- AI turn ---
         print("AI is thinking...")
-        col, _ = minmax(AI, board, depth, -float('inf'), +float('inf'))
-        # apply the AI's chosen column
+        col, _ = search(AI, board, depth)
+
+        # The search returns a column, not a board — it explored copies and
+        # kept none of them. Replaying the move here re-derives the resulting
+        # position from the same generator the human's move went through.
         for c, child in get_next_move(board, AI):
             if c == col:
                 board = child

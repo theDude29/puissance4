@@ -2,11 +2,11 @@
 
 A Connect-4 (Puissance 4) engine and terminal front-end in plain Python, no
 dependencies. The interesting part is the search: a negamax with alpha-beta
-pruning, documented below.
+pruning, a transposition table and iterative deepening, documented below.
 
 ```bash
-python3 main.py        # AI searches 5 plies ahead
-python3 main.py 7      # deeper, slower
+python3 main.py        # AI searches 9 plies ahead, ~0.4 s per move
+python3 main.py 11     # deeper, slower
 ```
 
 You play `X` and move first; the AI answers as `O`. Columns are 1-indexed at
@@ -89,7 +89,7 @@ from the perspective of the side to move. A child is searched for the
 simply its negation:
 
 ```python
-_, child_score = minmax(-player, child, depth - 1, -b, -a)
+_, child_score = minmax(-player, child, depth - 1, -b, -a, tt)
 val = -child_score
 ```
 
@@ -171,7 +171,7 @@ bare score from the cutoff branch makes the caller's tuple unpacking raise
 
 `best_score` starts at `-inf` as a sentinel and is updated under
 `val > best_score`, so `best_move` is only assigned when some child beats it.
-It is nevertheless seeded up front with the first legal column:
+It is nevertheless seeded up front with the first column to be tried:
 
 ```python
 best_move = next_moves[0][0]
@@ -188,34 +188,106 @@ Seeding rather than relaxing the guard to `>=` is deliberate: `>=` would also
 remove the `None`, but it would shift tie-breaking to the *last* equal-scoring
 column and change the AI's play in ordinary positions, where ties are common.
 
+## Transposition table
+
+The same position is reachable by many move orders, and the plain search
+re-explores each arrival from scratch. `search` keeps a dict of what it has
+already worked out, keyed on `(tuple(board), player)` — the board alone is not
+enough, since a position is worth different things depending on who has to
+move.
+
+An entry holds four things: the depth it was searched to, the value, a bound
+kind, and the best move found. The bound kind is not optional. Under alpha-beta
+a value is often not exact: a cutoff proves only that the node is worth *at
+least* that much (`LOWER`), and a node where nothing raised alpha proves only
+*at most* (`UPPER`). Storing the number without saying which it is would be
+wrong. On a probe, `EXACT` returns immediately, `LOWER` raises alpha, `UPPER`
+lowers beta, and if the window collapses the node is done.
+
+The stored move is read back whatever depth produced it — as an ordering hint
+it costs nothing to be wrong — while the *value* is used only if the entry came
+from a search at least as deep as the one being asked for.
+
+### Why the key is a tuple and not a Zobrist hash
+
+Zobrist is the textbook answer: XOR a random word per occupied cell, update it
+in O(1) as moves are made. Measured here, it came out slightly *slower* — 2.18×
+against 2.26× for the tuple key. `tuple()` and its hash are C-level, the
+incremental XOR is Python bytecode, and the key is not the bottleneck anyway:
+`score` walks 69 lines per node and dominates everything. Zobrist would also
+mean threading the hash back out of `get_next_move`, changing its contract, and
+it reintroduces a collision risk that a tuple key does not have — dicts compare
+keys by equality, so an exact key cannot alias. Memory does not argue for it
+either: a depth-9 search stores about 7,600 entries.
+
+It would earn its keep in a C engine with bitboards and incremental make/unmake,
+where the eval is cheap enough for hashing to matter. Not in this one.
+
+### Mate scores, and the invariant that saves them
+
+`score` returns `±(WIN + depth)`, so a mate score depends on the depth that
+found it. That normally makes a transposition table unsound — the same mate,
+stored from one depth and reused at another, comes back wrong — and engines
+renormalise mate values on the way in and out.
+
+That is not needed here, because of a property of Connect-4 specifically: every
+move adds exactly one token, so the number of tokens fixes the ply. Two move
+orders reaching the same position always arrive at the same ply, hence at the
+same remaining depth. Entries left behind by shallower passes are refused by
+the `entry_depth >= depth` guard. Instrumenting the probe over a full search
+finds **0 reads at a depth other than the one requested**, iterative deepening
+included, so every value ever reused was produced at exactly the depth it is
+reused at — and the search still returns what a plain fixed-depth negamax
+returns.
+
+This is load-bearing. A variant where a move did not monotonically fill the
+board would break it, and the mate scores would then need renormalising.
+
+## Iterative deepening
+
+`search` is the public entry point. It searches depth 1, then 2, and so on up
+to the requested depth, all passes sharing one table.
+
+Re-searching from scratch each time sounds wasteful and is not: the tree grows
+geometrically, so every pass before the last costs a fraction of the total, and
+each one leaves its best move in the table for the next to try first. Good move
+ordering is what makes alpha-beta cut early, and the cheapest source of a good
+guess is a shallower search of the same position.
+
+Moves are otherwise ordered centre-outwards, since central columns take part in
+more lines. That ordering alone is worth more than the table: it is what turns
+a 2.2× speedup into 5.6×.
+
 ## What it buys
 
-Nodes visited on 10 random midgame positions, plain negamax versus the same
-search with pruning:
+Nodes visited on 10 random midgame positions, at each stage of the search:
 
-| depth | negamax | alpha-beta | ratio | time |
-| ----: | ------: | ---------: | ----: | ---: |
-| 4 | 26,274 | 7,615 | 3.5× | 0.08 s |
-| 5 | 176,209 | 36,134 | 4.9× | 0.36 s |
-| 6 | 1,184,570 | 132,141 | 9.0× | 1.33 s |
+| depth | negamax | + alpha-beta | + table, ordering, deepening |
+| ----: | ------: | -----------: | ---------------------------: |
+| 4 | 26,274 | 7,615 | 3,469 |
+| 5 | 176,209 | 36,134 | 10,113 |
+| 6 | 1,184,570 | 132,141 | 25,403 |
+| 7 | 7,830,509 | 579,869 | 62,282 |
 
-The gain compounds with depth, which is the point: pruning does not change the
-answer, it buys plies. Both searches return identical values on all 10
-positions at each of the three depths — that equivalence is the correctness
-test worth keeping.
+In wall-clock terms the last column is 5.2× faster than alpha-beta alone at
+depth 6 and 9.4× at depth 7. The gain compounds with depth, which is the whole
+point: none of this changes the answer, it buys plies. At the default depth of
+9 the AI moves in about 0.4 s.
 
-In theory perfect move ordering reduces the effective branching factor from
-`w` to `sqrt(w)`, i.e. roughly double the reachable depth for the same work.
-The measured ratios are below that ceiling because moves here are searched
-left to right, in no particular order.
+Every variant returns identical values on all 10 positions at every depth
+tested, and matches a plain unpruned negamax. That equivalence is the
+correctness test worth keeping — and it is not a given for a transposition
+table, see above.
 
 ## Known limits
 
-- **No move ordering.** Columns are searched 0..6. Trying the centre first, or
-  the previous iteration's best move, would cut far more — and it is the single
-  change that would most improve the numbers above.
-- **No transposition table.** Connect-4 transposes heavily; identical positions
-  are re-searched many times over.
+- **The table lives for one search.** It is dropped between moves, so work is
+  redone from one turn to the next. Keeping it would need the mate-score
+  renormalisation described above, since entries would then be probed at a
+  different remaining depth than they were stored at.
+- **No time control.** Iterative deepening makes the search interruptible — it
+  always has a complete shallower answer in hand — but nothing uses that yet;
+  the depth is fixed up front.
 - **`WIN` outranks the heuristic by a margin, not by construction.** See above:
   a side holding `BASE` open 3-in-a-rows would close the gap. Deriving `WIN`
   from `len(LINES) * BASE ** (K - 2)` would make it airtight.
