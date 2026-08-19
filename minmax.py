@@ -148,7 +148,10 @@ def minmax(player, board, depth, a, b):
 
     next_moves = get_next_move(board, player)
 
-    best_move = None
+    # seed with the first legal column: every branch can evaluate to -inf (a
+    # lost position), and `val > best_score` would then never fire and leave
+    # best_move as None. Keep `>` so ties go to the first column found.
+    best_move = next_moves[0][0]
     best_score = -float('inf')
 
     # negamax: each child is evaluated from the opponent's perspective, and
