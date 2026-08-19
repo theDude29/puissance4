@@ -135,7 +135,7 @@ def get_next_move(board, player):
     return moves
 
 
-def minmax(player, board, depth):
+def minmax(player, board, depth, a, b):
     """Return (best_column, best_score) for `player` to move.
 
     best_score is `player`'s heuristic value (higher is better; `+inf` a win,
@@ -147,8 +147,6 @@ def minmax(player, board, depth):
         return None, score(board, player)
 
     next_moves = get_next_move(board, player)
-    if not next_moves:
-        return None, score(board, player)
 
     best_move = None
     best_score = -float('inf')
@@ -156,10 +154,15 @@ def minmax(player, board, depth):
     # negamax: each child is evaluated from the opponent's perspective, and
     # because `score` is antisymmetric the value to `player` is its negation.
     for col, child in next_moves:
-        _, child_score = minmax(-player, child, depth - 1)
+        _, child_score = minmax(-player, child, depth - 1, -b, -a)
         val = -child_score
         if val > best_score:
             best_score = val
             best_move = col
+
+        a = max(a, val)
+
+        if a >= b:
+            break
 
     return best_move, best_score

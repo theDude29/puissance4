@@ -89,7 +89,7 @@ def play(depth=4):
 
         # --- AI turn ---
         print("AI is thinking...")
-        col, _ = minmax(AI, board, depth)
+        col, _ = minmax(AI, board, depth, -float('inf'), +float('inf'))
         # apply the AI's chosen column
         for c, child in get_next_move(board, AI):
             if c == col:
